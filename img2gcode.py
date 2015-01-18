@@ -11,7 +11,6 @@ class GCodeWriter():
     self.gain = power
     self.speed = feedrate
 
-    self.xys = (0,0,0)
     self.target_xys = (0,0,0)
 
     self.f = None
@@ -19,7 +18,7 @@ class GCodeWriter():
     self._reset_write_head()
 
   def pixel_value_to_laser_power(self, val):
-    if (val > self.WHITE_THRESHOLD): # Off-white counts as white (save adjust time. TODO: Remove adjust time from gcode firmware?)
+    if (val > self.WHITE_THRESHOLD): # Off-white counts as white (saves adjust time. TODO: Remove adjust time from gcode firmware?)
       val = 0xFF
 
     intensity = 0xFF - val # We want to burn the dark areas
@@ -50,15 +49,14 @@ class GCodeWriter():
     self.f.write(val + "\n")
 
   def _reset_write_head(self):
-    self.xys = (0,0,0)
     self.target_xys = (0,0,0)
 
   def _write_begin(self, outfile):
     self.f = open(outfile, "w")
     self.writeln("M05")
-    self.writeln("S0")
     self.writeln("G0 G90 G94 G17")
     self.writeln("G21")
+    self.writeln("S0")
     self.writeln("M03")
     self.writeln("G54")
     self.writeln("G1 F%d" % feedrate)
@@ -70,35 +68,41 @@ class GCodeWriter():
     self.writeln("G0 X0 Y0")
     self.f.close()
 
-  def _gcode_write(self, pos, val):
-    intensity = self.pixel_value_to_laser_power(val)
-    xys = (pos[0] / float(self.dpmm), pos[1] / float(self.dpmm), intensity)
+  def _write_xys(self, pos, s):
+    self.writeln("G1X%.2fY%.2fS%d" % (pos[0], pos[1], s))
 
-    if xys[2] == self.xys[2]: # same intensity
-      # If we're at zero intensity, just ignore this command entirely.
-      if xys[2] == 0:
-        return
+  def _gcode_write_line(self, start, end, pixels):
+    # Write a line from start to end xy coordinates, evenly spacing out pixels
+    # where pixels[0] occurs at start and pixels[-1] occurs at end.
+    # A "pixel" is defined as the midpoint of the line segment where the laser has a specific value
+    
+    # Line optimization: if the entire line is white pixels, disregard
+    if reduce(lambda x, y: x and y, map(lambda z: z > self.WHITE_THRESHOLD, pixels)):
+      print "White line, skipping"
+      return
 
-      # If we hit the end of the line, write command to there with current intensity
-      # and bump up a row
-      if self.xys[1] != xys[1]:
-        self.writeln("G1X%.2fS%d" % (xys[0], xys[2]))
-        self.writeln("")
-        self.writeln("G1Y%.2f" % xys[1])
-        self.xys = xys
+    pixels = [self.pixel_value_to_laser_power(v) for v in pixels]
 
-      # Else we're progressing forward under the same power, so ignore
+    start = (start[0] / float(self.dpmm), start[1] / float(self.dpmm))
+    end = (end[0] / float(self.dpmm), end[1] / float(self.dpmm))
 
-    else: # Different intensity
-      # Write our progress up to this point using the *old* intensity
-      # Then use this intensity for the next write.
-      
-      if xys[1] != self.xys[1]: # Different Y locations, use Y as well
-        self.writeln("")
-        self.writeln("G1X%.2fY%.2fS%d" % (xys[0], xys[1], self.xys[2]))
-      else:
-        self.writeln("G1X%.2fS%d" % (xys[0], self.xys[2]))
-      self.xys = xys
+    DIST = math.sqrt((end[0]-start[0])**2 + (end[1]-start[1])**2)
+    STEP_SIZE = DIST / (len(pixels) - 1) # Account for fencepost
+    UNIT_VEC = ((end[0]-start[0]) / DIST, (end[1]-start[1]) / DIST)
+    STEP_VEC = (UNIT_VEC[0] * STEP_SIZE, UNIT_VEC[1] * STEP_SIZE)
+    
+    # Left-shift by half-pixel so we burn across the pixel at the midpoint.
+    curr = (start[0] - STEP_VEC[0]/2.0, start[1] - STEP_VEC[1]/2.0)
+    self._write_xys(curr, 0) # Head to start with laser off
+    for power in pixels:
+      curr = (curr[0] + STEP_VEC[0], curr[1] + STEP_VEC[1])
+      self._write_xys(curr, power)
+
+    # Ensure we wrote the line correctly
+    eps = 0.001
+    print "Curr", curr, "End", end, "STEP_VEC", STEP_VEC
+    assert(curr[0] - (end[0] + STEP_VEC[0] / 2.0) < eps)
+    assert(curr[1] - (end[1] + STEP_VEC[1] / 2.0) < eps)
 
   def gcodify_image(self, infile, outfile):
     im = Image.open(infile)
@@ -110,22 +114,89 @@ class GCodeWriter():
 
     self._reset_write_head()
     self._write_begin(outfile)
-    for j in xrange(img_size[1]):
-      for i in xrange(img_size[0]):
-        if j % 2 == 1:
-          curr = (img_size[0] - i - 1, j) # Reverse on the way back
-        else: 
-          curr = (i,j)
-        img_px = (curr[0], img_size[1] - curr[1] - 1)
-        self._gcode_write(curr, grey_im.getpixel(img_px))
-
+    self.gcodify_horizontal(grey_im)
+    self.gcodify_vertical(grey_im)
+    self.gcodify_diagonal_bltr(grey_im)
+    self.gcodify_diagonal_tlbr(grey_im)
     self._write_end()
 
-if __name__ == "__main__":
-  size = 128, 128 # 1 value is 1 mm (128mm ~= 5in)
-  dpmm = 2
-  power = 0.9
-  feedrate = 2500
+  def _laserpx(self, img, x, y):
+    return img.getpixel((x, (img.size[1] - 1) - y))
 
+  def gcodify_horizontal(self, img):
+    for j in xrange(img.size[1]):
+      left = (0, j)
+      right = (img.size[0]-1, j)
+      if j % 2 == 0:
+        pixels = [self._laserpx(img, i, j) for i in xrange(img.size[0])]
+        self._gcode_write_line(left, right, pixels)
+      else:
+        pixels = [self._laserpx(img, img.size[0] - 1 - i, j) for i in xrange(img.size[0])]
+        self._gcode_write_line(right, left, pixels)
+
+
+  def gcodify_vertical(self, img):
+    for i in xrange(img.size[0]):
+      bot = (i, 0)
+      top = (i, img.size[1]-1)
+      if i % 2 == 0:
+        pixels = [self._laserpx(img, i, j) for j in xrange(img.size[1])]
+        self._gcode_write_line(bot, top, pixels)
+      else:
+        pixels = [self._laserpx(img, i, img.size[1] - 1 - j) for j in xrange(img.size[1])]
+        self._gcode_write_line(top, bot, pixels)
+
+  def gcodify_diagonal_bltr(self, img):
+    # Bottom left to top right
+    (l, h) = img.size
+
+    bl_xs = ([0] * (h - 1)) + range(0, l)
+    bl_ys = range(h - 1, 0, -1) + [0] * l
+    bls = zip(bl_xs, bl_ys)
+    
+    tr_xs = range(0, l) + ([l-1] * (h-1))
+    tr_ys = [h-1]*(l-1) + range(h-1, -1, -1)
+    trs = zip(tr_xs, tr_ys)
+
+    for (i, (bl, tr)) in enumerate(zip(bls, trs)):
+      num_pixels = tr[0]-bl[0]+1
+
+      if i % 2 == 0:
+        pixels = [self._laserpx(img, bl[0]+d, bl[1]+d) for d in xrange(0, num_pixels)]
+        self._gcode_write_line(bl, tr, pixels)
+      else:
+        pixels = [self._laserpx(img, tr[0]-d, tr[1]-d) for d in xrange(0, num_pixels)]
+        self._gcode_write_line(tr, bl, pixels)
+
+  def gcodify_diagonal_tlbr(self, img):
+    # Top left to bottom right
+    (l, h) = img.size
+
+    tl_xs = ([0] * (h - 1)) + range(0, l)
+    tl_ys = range(0, h) + [h-1] * (l - 1)
+    tls = zip(tl_xs, tl_ys)
+    
+    br_xs = range(0, l) + ([l-1] * (h-1))
+    br_ys = ([0]*(l-1)) + range(0, h)
+    brs = zip(br_xs, br_ys)
+
+    for (i, (tl, br)) in enumerate(zip(tls, brs)):
+      num_pixels = br[0]-tl[0]+1
+
+      if i % 2 == 0:
+        pixels = [self._laserpx(img, tl[0]+d, tl[1]-d) for d in xrange(0, num_pixels)]
+        self._gcode_write_line(tl, br, pixels)
+      else:
+        pixels = [self._laserpx(img, br[0]-d, br[1]+d) for d in xrange(0, num_pixels)]
+        self._gcode_write_line(br, tl, pixels)
+    
+
+if __name__ == "__main__":
+  size = 8, 8 # 1 value is 1 mm (128mm ~= 5in)
+  dpmm = 8
+  power = 0.7
+  feedrate = 400
+
+  assert(size[0] % 2 == 0 and size[1] % 2 == 0)
   writer = GCodeWriter(size, dpmm, power, feedrate)
   writer.gcodify_image(sys.argv[1], sys.argv[2])
